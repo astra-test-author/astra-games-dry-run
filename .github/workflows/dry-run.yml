@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: MIT
+#
+# Rehearses the games catalogue's staging "done when" (astra-plugins-ops
+# dev/game-integrations-plan-merged.md, G3) end to end, WITHOUT the plugins
+# service: a non-owner account (astra-test-author, not mihailinl) publishes a
+# C# test GI and a foo-engine foundation, both get ingested and signed in
+# ONE run, and a moderator M_REVOKE act on the GI lands in the withdrawn
+# document in that same run.
+#
+# This workflow reads mihailinl/astra-games-catalogue and AstraPlugins
+# read-only and never modifies either. Where the real sign.yml needs the
+# live plugins service and the production signing keys, this run supplies
+# its own throwaway TEST root key and TEST games keys (bin/keygen.mjs,
+# never GAMES_SIGNING_KEY_CURRENT/NEXT) -- see scripts/dry-sign.mjs's header
+# for exactly which seam that uses and why it is not an edit to the
+# catalogue.
+
+name: Staging rehearsal (G3 done-when)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CATALOGUE_REPO: mihailinl/astra-games-catalogue
+  CSHARP_REPO: astra-test-author/astra-gi-staging-csharp
+  FOUNDATION_REPO: astra-test-author/astra-foundation-foo-engine
+  # The public sha256 of each repository's `.well-known/astra-gi-owner` binding
+  # token (DEC-2: the token itself is public; this is not a secret).
+  CSHARP_BINDING_SHA256: f905969d90fe16f9af533ff3873ef9c9f6f0af574b3e6f0938c8cadd125c8783
+  FOUNDATION_BINDING_SHA256: f53ba1351b4df250659f40297cdd5cd0b68d3b6aae86b5f8121550ae0bd4e735
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout this rehearsal repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+        with:
+          persist-credentials: false
+
+      - name: Checkout astra-games-catalogue (main) -- read-only reference, never modified
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+        with:
+          repository: ${{ env.CATALOGUE_REPO }}
+          ref: main
+          path: catalogue
+          persist-credentials: false
+
+      - name: Checkout astra-games-catalogue's data branch, if it exists yet
+        id: data_checkout
+        continue-on-error: true
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+        with:
+          repository: ${{ env.CATALOGUE_REPO }}
+          ref: data
+          path: catalogue-data
+          persist-credentials: false
+
+      - name: An empty state when `data` does not exist yet (the catalogue has signed nothing yet)
+        run: |
+          set -euo pipefail
+          mkdir -p catalogue-data
+          echo "data branch checkout: ${{ steps.data_checkout.outcome }} -- lib/state.mjs's loadState() reads an empty state from a directory with no files in it either way"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Fetch the pinned gi-probe, exactly as ingest.yml's ingest job does
+        run: node catalogue/bin/fetch-gi-probe.mjs --dir "$RUNNER_TEMP/bin"
+
+      - name: Resolve both releases' real repo ids and tags from the GitHub API
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          csharp_repo_id=$(gh api "repos/${CSHARP_REPO}" --jq .id)
+          csharp_owner_id=$(gh api "repos/${CSHARP_REPO}" --jq .owner.id)
+          csharp_tag=$(gh api "repos/${CSHARP_REPO}/releases/latest" --jq .tag_name)
+          csharp_release_id=$(gh api "repos/${CSHARP_REPO}/releases/latest" --jq .id)
+          foundation_repo_id=$(gh api "repos/${FOUNDATION_REPO}" --jq .id)
+          foundation_owner_id=$(gh api "repos/${FOUNDATION_REPO}" --jq .owner.id)
+          foundation_tag=$(gh api "repos/${FOUNDATION_REPO}/releases/latest" --jq .tag_name)
+          foundation_release_id=$(gh api "repos/${FOUNDATION_REPO}/releases/latest" --jq .id)
+          owner_id=$(gh api orgs/astra-test-author --jq .id)
+          echo "csharp_repo_id=$csharp_repo_id" >> "$GITHUB_OUTPUT"
+          echo "csharp_tag=$csharp_tag" >> "$GITHUB_OUTPUT"
+          echo "foundation_repo_id=$foundation_repo_id" >> "$GITHUB_OUTPUT"
+          echo "foundation_tag=$foundation_tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Resolved from the GitHub API"
+            echo "- astra-test-author org id: $owner_id (mihailinl is 193032699 -- this run's owner is NOT mihailinl)"
+            echo "- $CSHARP_REPO: repo_id=$csharp_repo_id owner_id=$csharp_owner_id tag=$csharp_tag release_id=$csharp_release_id"
+            echo "- $FOUNDATION_REPO: repo_id=$foundation_repo_id owner_id=$foundation_owner_id tag=$foundation_tag release_id=$foundation_release_id"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write one astra.games.leases/1 request file per release
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/requests"
+          BINDING_TOKEN_SHA256="$CSHARP_BINDING_SHA256" node scripts/write-request.mjs csharp-gi \
+            "${{ steps.resolve.outputs.csharp_repo_id }}" "${{ steps.resolve.outputs.csharp_tag }}" \
+            "$RUNNER_TEMP/requests/games-request-csharp-gi.json"
+          BINDING_TOKEN_SHA256="$FOUNDATION_BINDING_SHA256" node scripts/write-request.mjs foo-engine-foundation \
+            "${{ steps.resolve.outputs.foundation_repo_id }}" "${{ steps.resolve.outputs.foundation_tag }}" \
+            "$RUNNER_TEMP/requests/games-request-foo-engine-foundation.json"
+
+      - name: Ingest both leases (bin/ingest.mjs, read-only token)
+        id: ingest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          echo "## Ingest verdicts" >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          for lease in csharp-gi foo-engine-foundation; do
+            node catalogue/bin/ingest.mjs --data catalogue-data \
+              --request "$RUNNER_TEMP/requests/games-request-$lease.json" --lease "$lease" \
+              --out "$RUNNER_TEMP/out/candidate-$lease.json"
+            node scripts/print-verdict.mjs "$lease" "$RUNNER_TEMP/out/candidate-$lease.json" || status=1
+          done
+          if [ "$status" != "0" ]; then
+            echo "::error::at least one lease did not reach verdict=accept -- see the findings printed above; step (d) is skipped"
+            exit 1
+          fi
+
+      - name: "Step (d): sign both candidates and one M_REVOKE act with TEST keys, then verify"
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/dry-sign.mjs \
+            --catalogue "$PWD/catalogue" \
+            --data "$PWD/catalogue-data" \
+            --candidates "$RUNNER_TEMP/out/candidate-csharp-gi.json,$RUNNER_TEMP/out/candidate-foo-engine-foundation.json" \
+            --revoke-repo-id "${{ steps.resolve.outputs.csharp_repo_id }}" \
+            --revoke-entry-id "astra-test-author/gi-staging-csharp" \
+            --keys-dir "$RUNNER_TEMP/keys" \
+            --report "$RUNNER_TEMP/keys/dry-sign-report.json"
+          {
+            echo "## Sign result"
+            echo '```json'
+            cat "$RUNNER_TEMP/keys/dry-sign-report.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect public-only artifacts (never a private seed)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/publish"
+          cp -r "$RUNNER_TEMP/requests" "$RUNNER_TEMP/publish/requests" 2>/dev/null || true
+          cp -r "$RUNNER_TEMP/out" "$RUNNER_TEMP/publish/candidates" 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/publish/signed"
+          for f in trust.json dry-sign-report.json; do
+            [ -f "$RUNNER_TEMP/keys/$f" ] && cp "$RUNNER_TEMP/keys/$f" "$RUNNER_TEMP/publish/signed/$f"
+          done
+          for f in games-index.json games-withdrawn.json; do
+            [ -f "catalogue-data/dist/$f" ] && cp "catalogue-data/dist/$f" "$RUNNER_TEMP/publish/signed/$f"
+          done
+          echo "publishing (no private key material):"
+          find "$RUNNER_TEMP/publish" -type f
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (v4.6.2)
+        with:
+          name: staging-rehearsal
+          path: ${{ runner.temp }}/publish
+          if-no-files-found: warn
